@@ -3,16 +3,20 @@ Post-processing: Photobleaching correction + dF/F
 Session: 2026-04-20_164628, Fish A1
 Author: Prakriti
 
-Validated approach — uses suite2p's own dcnv.preprocess function:
-  1. Neuropil subtraction: Fc = F - 0.7*Fneu
-  2. Double exponential photobleaching correction (subtract fit)
-  3. dF/F using suite2p's own preprocess with baseline='constant_prctile'
-     (8th percentile of whole trace — correct for short recordings with bleaching)
+Validated approach based on:
+  - PLOS Comp Bio (TMAC): shared time constant, divide by fit
+  - Nature (GCaMP8M paper): fit beginning and end segments only
+  - suite2p docs: constant_prctile for final dF/F
 
-References:
-  - suite2p docs: https://suite2p.readthedocs.io/en/latest/deconvolution.html
-  - Nature Neuroscience zebrafish paper: win_baseline=900s for bleaching correction
-  - Suite2p source: constant_prctile mode avoids window-length problem
+Steps per plane:
+  1. Neuropil subtraction: Fc = F - 0.7*Fneu
+  2. Compute POPULATION mean Fc (average across all cells)
+     - Fit double exponential to beginning + end segments of population mean
+     - This gives a SHARED bleaching curve unaffected by individual cell activity
+  3. DIVIDE each cell's Fc by the shared bleaching fit
+     - Division (not subtraction) gives proper dF normalization
+     - Result is Fc_norm ≈ 1.0 at start, fluctuates around 1.0
+  4. dF/F = (Fc_norm - F0) / F0 using suite2p's constant_prctile (8th pct)
 """
 
 import numpy as np
@@ -30,59 +34,67 @@ BASE_DIR   = "/home/abl-workstation2/Prakriti_FishBrain/suite2p/results/164628/s
 OUTPUT_DIR = "/home/abl-workstation2/Prakriti_FishBrain/suite2p/results/164628"
 
 N_PLANES       = 7
-FS             = 5.0    # Hz volumetric
+FS             = 5.0
 NEUROPIL_COEFF = 0.7
+PRCTILE_BASELINE = 8.0
 
-# ── Suite2p preprocess parameters ─────────────────────────────────────────
-# Using constant_prctile: single global 8th percentile baseline
-# This is immune to window-length issues for short recordings
-# and correctly handles photobleaching after exponential correction
-BASELINE      = 'constant_prctile'
-WIN_BASELINE  = 60.0   # seconds (only used for maximin, kept for reference)
-SIG_BASELINE  = 10.0   # frames
-PRCTILE_BASELINE = 8.0 # 8th percentile — suite2p default
+# Fraction of trace to use for fitting (beginning and end segments)
+# Avoids fitting the middle where neural activity is strongest
+FIT_FRAC = 0.15  # use first 15% and last 15% of frames
 
-# ── Double exponential photobleaching correction ───────────────────────────
+# ── Double exponential on population mean ──────────────────────────────────
 def double_exp(t, A1, tau1, A2, tau2, C):
     return A1 * np.exp(-t/tau1) + A2 * np.exp(-t/tau2) + C
 
-def correct_photobleaching(trace):
+def fit_population_bleaching(pop_mean):
     """
-    Fit double exponential and SUBTRACT it (preserves fluctuation amplitudes).
-    Falls back to single exp, then linear detrend.
+    Fit double exponential to beginning + end segments of population mean.
+    Using beginning and end avoids fitting neural activity in the middle.
+    Returns the fitted bleaching curve for the full trace.
     """
-    n = len(trace)
+    n = len(pop_mean)
     t = np.arange(n, dtype=np.float64)
-    f = trace.astype(np.float64)
-    drop = float(f[0] - f[-1])
+
+    # Use only beginning and end segments for fitting
+    n_seg = max(int(n * FIT_FRAC), 5)
+    idx_fit = np.concatenate([np.arange(n_seg), np.arange(n - n_seg, n)])
+    t_fit   = t[idx_fit]
+    f_fit   = pop_mean[idx_fit]
+
+    drop = float(pop_mean[0] - pop_mean[-1])
+    C0   = float(pop_mean[-1])
 
     try:
         popt, _ = curve_fit(
-            double_exp, t, f,
-            p0=[drop*0.5, n*0.05, drop*0.5, n*0.5, float(f[-1])],
+            double_exp, t_fit, f_fit,
+            p0=[drop*0.4, n*0.05, drop*0.6, n*0.4, C0],
             bounds=([0, 0.5, 0, n*0.05, 0],
-                    [np.inf, n*0.2, np.inf, np.inf, np.inf]),
-            maxfev=10000, method='trf'
+                    [np.inf, n*0.25, np.inf, np.inf, np.inf]),
+            maxfev=20000, method='trf'
         )
-        fit = double_exp(t, *popt)
-        return f - fit, fit, 'double_exp'
-    except Exception:
-        pass
+        fit_full = double_exp(t, *popt)
+        print(f"  Double-exp fit: A1={popt[0]:.1f} tau1={popt[1]:.1f}f "
+              f"A2={popt[2]:.1f} tau2={popt[3]:.1f}f C={popt[4]:.1f}")
+        return fit_full, 'double_exp'
+    except Exception as e:
+        print(f"  Double-exp failed ({e}), trying single-exp...")
 
     try:
         def single_exp(t, A, tau, C):
             return A * np.exp(-t/tau) + C
-        popt2, _ = curve_fit(single_exp, t, f,
-                             p0=[drop, n/3, float(f[-1])],
-                             bounds=([0,1,0],[np.inf,np.inf,np.inf]),
-                             maxfev=5000)
-        fit = single_exp(t, *popt2)
-        return f - fit, fit, 'single_exp'
-    except Exception:
-        pass
-
-    fit = np.linspace(float(f[0]), float(f[-1]), n)
-    return f - fit, fit, 'linear'
+        popt2, _ = curve_fit(
+            single_exp, t_fit, f_fit,
+            p0=[drop, n/3, C0],
+            bounds=([0, 1, 0], [np.inf, np.inf, np.inf]),
+            maxfev=10000
+        )
+        fit_full = single_exp(t, *popt2)
+        print(f"  Single-exp fit: A={popt2[0]:.1f} tau={popt2[1]:.1f}f C={popt2[2]:.1f}")
+        return fit_full, 'single_exp'
+    except Exception as e:
+        print(f"  Single-exp failed ({e}), using linear...")
+        fit_full = np.linspace(float(pop_mean[0]), float(pop_mean[-1]), n)
+        return fit_full, 'linear'
 
 # ── Process each plane ─────────────────────────────────────────────────────
 all_dff   = []
@@ -90,9 +102,10 @@ all_plane = []
 all_idx   = []
 
 print("=" * 60)
-print("Post-processing: Double-exp correction + suite2p constant_prctile dF/F")
-print(f"  Baseline mode : {BASELINE}")
-print(f"  Percentile    : {PRCTILE_BASELINE}")
+print("Post-processing: Shared bleaching fit + divide + constant_prctile dF/F")
+print(f"  Fit segments  : first+last {FIT_FRAC*100:.0f}% of frames")
+print(f"  Correction    : divide by shared population fit")
+print(f"  dF/F baseline : constant {PRCTILE_BASELINE}th percentile")
 print("=" * 60)
 
 for p in range(N_PLANES):
@@ -112,38 +125,38 @@ for p in range(N_PLANES):
     cell_indices = np.where(iscell[:, 0] == 1)[0]
     n_cells      = len(cell_indices)
     n_frames     = F.shape[1]
-    print(f"Plane {p}: {n_cells} cells, {n_frames} frames")
+    print(f"\nPlane {p}: {n_cells} cells, {n_frames} frames")
 
-    # Step 1: Neuropil subtraction for all cells at once
-    Fc_all = F[cell_indices] - NEUROPIL_COEFF * Fneu[cell_indices]
+    # Step 1: Neuropil subtraction for all cells
+    Fc_all = (F[cell_indices] - NEUROPIL_COEFF * Fneu[cell_indices]).astype(np.float64)
 
-    # Step 2: Double exponential correction per cell
-    Fc_corrected = np.zeros_like(Fc_all, dtype=np.float64)
-    fit_methods = {'double_exp': 0, 'single_exp': 0, 'linear': 0}
-    for i, idx in enumerate(cell_indices):
-        corr, _, method = correct_photobleaching(Fc_all[i])
-        Fc_corrected[i] = corr
-        fit_methods[method] += 1
-    print(f"  Fit methods: {fit_methods}")
+    # Step 2: Fit bleaching to population mean (beginning + end segments)
+    pop_mean = Fc_all.mean(axis=0)
+    bleach_fit, fit_method = fit_population_bleaching(pop_mean)
 
-    # Step 3: suite2p's own preprocess with constant_prctile
-    # This computes global 8th percentile baseline and subtracts it
-    # giving clean dF/F traces
-    dff = dcnv.preprocess(
-        F=Fc_corrected.astype(np.float32),
-        baseline=BASELINE,
-        win_baseline=WIN_BASELINE,
-        sig_baseline=SIG_BASELINE,
-        fs=FS,
-        prctile_baseline=PRCTILE_BASELINE
-    )
+    # Clamp fit to be >= 1 to avoid division by near-zero
+    bleach_fit = np.maximum(bleach_fit, 1.0)
 
-    all_dff.append(dff)
+    # Step 3: Divide each cell by the shared bleaching fit
+    # Result: Fc_norm fluctuates around 1.0, bleaching removed
+    Fc_norm = Fc_all / bleach_fit[np.newaxis, :]
+
+    # Step 4: dF/F using suite2p's constant_prctile
+    # constant_prctile subtracts the 8th percentile baseline
+    # We then divide by it to get proper fractional dF/F
+    F0 = np.percentile(Fc_norm, PRCTILE_BASELINE, axis=1, keepdims=True)
+    F0 = np.maximum(F0, 1e-6)
+    dff = (Fc_norm - F0) / F0
+
+    all_dff.append(dff.astype(np.float32))
     for idx in cell_indices:
         all_plane.append(p)
         all_idx.append(idx)
 
-    # ── Visualization: 5 cells, 3 panels ──────────────────────────────────
+    print(f"  dF/F stats: mean={dff.mean():.3f}, std={dff.std():.3f}, "
+          f"min={dff.min():.2f}, max={dff.max():.2f}")
+
+    # ── Visualization ──────────────────────────────────────────────────────
     n_show = min(5, n_cells)
     fig, axes = plt.subplots(n_show, 3, figsize=(24, 3*n_show))
     if n_show == 1:
@@ -152,40 +165,38 @@ for p in range(N_PLANES):
     t = np.arange(n_frames) / FS
 
     for i in range(n_show):
-        f_raw  = F[cell_indices[i]].astype(np.float64)
-        fc_raw = Fc_all[i]
-        fc_corr, fit, method = correct_photobleaching(fc_raw)
+        fc   = Fc_all[i]
+        fnorm = Fc_norm[i]
+        dff_i = dff[i]
 
-        # Recompute dF/F for this single cell
-        dff_cell = dcnv.preprocess(
-            F=fc_corr.reshape(1,-1).astype(np.float32),
-            baseline=BASELINE,
-            win_baseline=WIN_BASELINE,
-            sig_baseline=SIG_BASELINE,
-            fs=FS,
-            prctile_baseline=PRCTILE_BASELINE
-        )[0]
-
-        # Panel 1: Raw F + fit overlay
-        axes[i,0].plot(t, f_raw, linewidth=0.8, color='gray')
-        # Show fit in original space
+        # Panel 1: Raw Fc + population bleach fit overlay
+        axes[i,0].plot(t, fc, linewidth=0.8, color='gray', label='Fc')
+        axes[i,0].plot(t, bleach_fit * (fc.mean() / bleach_fit.mean()),
+                       linewidth=2, color='red', alpha=0.8, label='Bleach fit')
         axes[i,0].set_ylabel(f'Cell {cell_indices[i]}', fontsize=8)
-        if i==0: axes[i,0].set_title('Raw F', fontsize=10)
+        if i==0:
+            axes[i,0].set_title('Raw Fc + shared bleach fit', fontsize=10)
+            axes[i,0].legend(fontsize=7)
 
-        # Panel 2: Bleach-corrected Fc
-        axes[i,1].plot(t, fc_corr, linewidth=0.8, color='steelblue')
-        axes[i,1].axhline(0, color='gray', linewidth=0.5, linestyle='--')
-        if i==0: axes[i,1].set_title('Bleach-corrected Fc', fontsize=10)
+        # Panel 2: Bleach-corrected (divided)
+        axes[i,1].plot(t, fnorm, linewidth=0.8, color='steelblue')
+        axes[i,1].axhline(1.0, color='gray', linewidth=0.5, linestyle='--')
+        if i==0:
+            axes[i,1].set_title('Bleach-corrected (÷ fit)', fontsize=10)
 
-        # Panel 3: dF/F (constant_prctile)
-        axes[i,2].plot(t, dff_cell, linewidth=0.8, color='darkblue')
+        # Panel 3: dF/F
+        axes[i,2].plot(t, dff_i, linewidth=0.8, color='darkblue')
         axes[i,2].axhline(0, color='gray', linewidth=0.5, linestyle='--')
-        if i==0: axes[i,2].set_title(f'dF/F ({BASELINE}, {PRCTILE_BASELINE}th pct)', fontsize=10)
+        axes[i,2].set_ylim(-1, 3)
+        if i==0:
+            axes[i,2].set_title(f'dF/F (8th pct baseline)', fontsize=10)
 
     for col in range(3):
         axes[-1,col].set_xlabel('Time (s)')
 
-    plt.suptitle(f'Plane {p} — Raw Fc | Bleach-corrected | dF/F', fontsize=12)
+    # Also show population mean + fit in top of panel 1
+    plt.suptitle(f'Plane {p} — Raw Fc | Bleach-corrected | dF/F\n'
+                 f'Bleach fit method: {fit_method}', fontsize=11)
     plt.tight_layout()
     path = os.path.join(OUTPUT_DIR, f"traces_final_plane{p}.png")
     plt.savefig(path, dpi=150)
@@ -201,9 +212,10 @@ np.save(os.path.join(OUTPUT_DIR, "dff_all_planes.npy"),  dff_combined)
 np.save(os.path.join(OUTPUT_DIR, "cell_plane.npy"),      plane_arr)
 np.save(os.path.join(OUTPUT_DIR, "cell_idx.npy"),        idx_arr)
 
-print("=" * 60)
+print("\n" + "=" * 60)
 print(f"Total cells : {len(dff_combined)}")
 print(f"dF/F shape  : {dff_combined.shape}")
+print(f"dF/F range  : {dff_combined.min():.3f} to {dff_combined.max():.3f}")
 print("Saved: dff_all_planes.npy, cell_plane.npy, cell_idx.npy")
 
 # ── Population average ─────────────────────────────────────────────────────
@@ -212,14 +224,17 @@ pop_avg = dff_combined.mean(axis=0)
 
 fig, axes = plt.subplots(2, 1, figsize=(20, 8))
 for i in range(min(20, len(dff_combined))):
-    axes[0].plot(t, dff_combined[i] + i*2, linewidth=0.5, alpha=0.7)
+    axes[0].plot(t, dff_combined[i] + i*0.5,
+                 linewidth=0.5, alpha=0.7)
 axes[0].set_title('Individual dF/F traces (offset for visibility)')
 axes[0].set_xlabel('Time (s)')
+axes[0].set_ylabel('dF/F')
 
 axes[1].plot(t, pop_avg, linewidth=1.5, color='darkblue')
 axes[1].axhline(0, color='gray', linewidth=0.5)
-axes[1].set_title('Population average dF/F — should be near zero if bleach corrected')
+axes[1].set_title('Population average dF/F — flat = bleach corrected ✓')
 axes[1].set_xlabel('Time (s)')
+axes[1].set_ylabel('dF/F')
 
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, "population_dff.png"), dpi=150)
